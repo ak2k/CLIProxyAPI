@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/thinking"
@@ -133,6 +134,7 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 		return nil, err
 	}
 	helps.RecordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
+	helps.RecordAnthropicRateLimit(authID, httpResp.Header, time.Now())
 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
 		// Decompress error responses — pass the Content-Encoding value (may be empty)
 		// and let decodeResponseBody handle both header-declared and magic-byte-detected
@@ -142,7 +144,7 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 			helps.RecordAPIResponseError(ctx, e.cfg, decErr)
 			msg := fmt.Sprintf("failed to decode error response body: %v", decErr)
 			helps.LogWithRequestID(ctx).Warn(msg)
-			return nil, statusErr{code: httpResp.StatusCode, msg: msg}
+			return nil, newClaudeStatusErr(httpResp.StatusCode, httpResp.Header, []byte(msg))
 		}
 		b, readErr := io.ReadAll(errBody)
 		if readErr != nil {
@@ -156,7 +158,7 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 		if errClose := errBody.Close(); errClose != nil {
 			log.Errorf("response body close error: %v", errClose)
 		}
-		err = statusErr{code: httpResp.StatusCode, msg: string(b)}
+		err = newClaudeStatusErr(httpResp.StatusCode, httpResp.Header, b)
 		return nil, err
 	}
 	decodedBody, err := decodeResponseBody(httpResp.Body, httpResp.Header.Get("Content-Encoding"))
