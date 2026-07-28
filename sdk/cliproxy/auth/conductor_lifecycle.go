@@ -142,6 +142,14 @@ func (m *Manager) Update(ctx context.Context, auth *Auth) (*Auth, error) {
 		m.scheduler.upsertAuth(authClone)
 	}
 	m.queueRefreshReschedule(auth.ID)
+	// An in-place update of an existing auth.ID may be a credential
+	// rotation (same ID, new underlying account), so drop the Anthropic
+	// rate-limit hint rather than let the management API report the
+	// previous credential's quota. Centralised here, in the manager
+	// lifecycle, so direct callers (the management auth-file handlers
+	// upsert via Manager.Update without going through the SDK service
+	// path) are covered too. No-op for IDs without a stored hint.
+	DeleteAnthropicRateLimitHint(auth.ID)
 	_ = m.persist(ctx, auth)
 	m.hook.OnAuthUpdated(ctx, auth.Clone())
 	if clearedCooldown {
@@ -192,6 +200,11 @@ func (m *Manager) Remove(ctx context.Context, id string) {
 	}
 	m.queueRefreshUnschedule(id)
 	m.invalidateSessionAffinity(id)
+	// Scrub the Anthropic rate-limit hint so an auth recreated with the
+	// same ID cannot surface the removed credential's quota. Provider-
+	// agnostic: the hint store is keyed by authID and this is a no-op for
+	// IDs without a stored hint.
+	DeleteAnthropicRateLimitHint(id)
 
 	if provider != "" {
 		if exec, ok := m.Executor(provider); ok && exec != nil {
