@@ -1,6 +1,8 @@
 package auth
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"strings"
 	"sync"
 	"time"
@@ -55,6 +57,16 @@ type AnthropicRateLimitHint struct {
 	// as a lower-cased name → first value map. Forward-compat safety net for
 	// undocumented schema drift; may be nil when no headers were captured.
 	RawHeaders map[string]string
+	// AccountFingerprint identifies the underlying account this capture came
+	// from (see AnthropicAccountFingerprint). The hint store is keyed by auth
+	// ID, but an ID can be reused across credentials — a rotation in place, or
+	// a delete-then-recreate. Tagging the capture lets readers reject a hint
+	// that demonstrably belongs to a different account instead of reporting the
+	// previous credential's quota.
+	//
+	// Empty means "account unknown" (e.g. an OAuth credential with no email in
+	// metadata) and never causes rejection; see AnthropicRateLimitHintFor.
+	AccountFingerprint string
 }
 
 // AnthropicQuotaWindow records per-window state captured from
@@ -161,11 +173,64 @@ func HasKnownAnthropicRateLimitHint(authID string) bool {
 	return ok && hint.Known
 }
 
+// AnthropicAccountFingerprint derives a stable, non-secret identifier for the
+// account behind an auth, used to detect that a reused auth ID now refers to a
+// different credential.
+//
+// Returns "" when the account cannot be identified (nil auth, or an OAuth
+// credential whose metadata carries no email). Callers must treat "" as
+// "unknown" rather than as a distinct account.
+//
+// The underlying AccountInfo value is hashed rather than stored: for API-key
+// auths it is the API key itself, which must not sit in a process-wide map or
+// reach a management response.
+func AnthropicAccountFingerprint(auth *Auth) string {
+	if auth == nil {
+		return ""
+	}
+	kind, value := auth.AccountInfo()
+	value = strings.TrimSpace(value)
+	if kind == "" || value == "" {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(kind + "\x00" + value))
+	return hex.EncodeToString(sum[:8])
+}
+
+// AnthropicRateLimitHintFor returns the stored hint for an auth, rejecting a
+// capture that provably belongs to a different account under the same auth ID.
+//
+// Rejection requires both fingerprints to be non-empty and different. An empty
+// fingerprint on either side means "account unknown", which resolves to serving
+// the hint: an unknown account is the pre-existing ID-only behaviour, whereas
+// rejecting on unknown would discard valid state every time an account became
+// unidentifiable — for instance a token refresh that returns no email.
+//
+// This is what makes the store safe against auth-lifecycle events without
+// hooking them. A capture still in flight when a credential rotates lands under
+// the old fingerprint and is rejected here rather than resurrecting stale quota.
+func AnthropicRateLimitHintFor(auth *Auth) (AnthropicRateLimitHint, bool) {
+	if auth == nil {
+		return AnthropicRateLimitHint{}, false
+	}
+	hint, ok := GetAnthropicRateLimitHint(auth.ID)
+	if !ok {
+		return AnthropicRateLimitHint{}, false
+	}
+	expected := AnthropicAccountFingerprint(auth)
+	if expected != "" && hint.AccountFingerprint != "" && expected != hint.AccountFingerprint {
+		return AnthropicRateLimitHint{}, false
+	}
+	return hint, true
+}
+
 // DeleteAnthropicRateLimitHint removes any stored hint for an auth. Empty
 // authID is a no-op. Concurrent-safe.
 //
-// Called from sdk/cliproxy.applyCoreAuthRemoval so a recreated auth with the
-// same ID cannot surface stale quota state via the management API.
+// Called from Manager.Remove to release the entry when a credential goes away.
+// Correctness against a reused auth ID does not depend on this running:
+// AnthropicRateLimitHintFor rejects a capture whose account fingerprint no
+// longer matches, which also covers a capture that lands after the delete.
 func DeleteAnthropicRateLimitHint(authID string) {
 	authID = strings.TrimSpace(authID)
 	if authID == "" {

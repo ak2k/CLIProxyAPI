@@ -21,11 +21,9 @@ func fixedObservedAt() time.Time {
 // it but each test uses a unique authID.
 func resetClaudeRateLimitHint(t *testing.T, authID string) {
 	t.Helper()
-	// SetAnthropicRateLimitHint with Known=false acts as a soft-clear for
-	// tests that check Known=false → nil entry. For full removal we'd need
-	// a Delete API; absent that, unique authIDs prevent cross-pollution.
+	coreauth.DeleteAnthropicRateLimitHint(authID)
 	t.Cleanup(func() {
-		coreauth.SetAnthropicRateLimitHint(authID, coreauth.AnthropicRateLimitHint{Known: false})
+		coreauth.DeleteAnthropicRateLimitHint(authID)
 	})
 }
 
@@ -402,5 +400,73 @@ func TestBuildClaudeRateLimitEntry_ProviderCasingIsTolerant(t *testing.T) {
 		if got := buildClaudeRateLimitEntry(auth); got == nil {
 			t.Errorf("provider %q: expected non-nil entry but got nil", providerCasing)
 		}
+	}
+}
+
+// claudeAuthWithEmail builds a Claude OAuth auth whose account fingerprint
+// resolves from the given email.
+func claudeAuthWithEmail(authID, email string) *coreauth.Auth {
+	return &coreauth.Auth{
+		ID:       authID,
+		Provider: "claude",
+		Metadata: map[string]any{"email": email},
+	}
+}
+
+func TestBuildClaudeRateLimitEntry_RejectsHintFromDifferentAccount(t *testing.T) {
+	const authID = "claude-test-rotated@example.com"
+	resetClaudeRateLimitHint(t, authID)
+
+	previous := claudeAuthWithEmail(authID, "before-rotation@example.com")
+	coreauth.SetAnthropicRateLimitHint(authID, coreauth.AnthropicRateLimitHint{
+		Known:              true,
+		ObservedAt:         fixedObservedAt(),
+		Status:             "rejected",
+		AccountFingerprint: coreauth.AnthropicAccountFingerprint(previous),
+	})
+
+	// Same auth ID, different underlying account: an in-place rotation, or a
+	// capture that landed after the credential was swapped out.
+	rotated := claudeAuthWithEmail(authID, "after-rotation@example.com")
+	if got := buildClaudeRateLimitEntry(rotated); got != nil {
+		t.Fatalf("expected nil for a hint captured against a different account, got %v", got)
+	}
+
+	// The original account still reads its own capture.
+	if got := buildClaudeRateLimitEntry(previous); got == nil {
+		t.Fatal("expected the capturing account to still see its own hint")
+	}
+}
+
+func TestBuildClaudeRateLimitEntry_ServesHintWhenAccountUnknown(t *testing.T) {
+	const authID = "claude-test-unknown-account@example.com"
+	resetClaudeRateLimitHint(t, authID)
+
+	// A capture stored without a fingerprint (auth had no identifiable
+	// account at capture time) must stay readable rather than being treated
+	// as belonging to some other account.
+	coreauth.SetAnthropicRateLimitHint(authID, coreauth.AnthropicRateLimitHint{
+		Known:      true,
+		ObservedAt: fixedObservedAt(),
+		Status:     "allowed",
+	})
+
+	if got := buildClaudeRateLimitEntry(claudeAuthWithEmail(authID, "someone@example.com")); got == nil {
+		t.Fatal("hint with no fingerprint should be served, not rejected")
+	}
+
+	// And the mirror case: a fingerprinted capture read back through an auth
+	// whose account is no longer identifiable (e.g. a refresh that returned
+	// no email) must not be discarded.
+	resetClaudeRateLimitHint(t, authID)
+	coreauth.SetAnthropicRateLimitHint(authID, coreauth.AnthropicRateLimitHint{
+		Known:              true,
+		ObservedAt:         fixedObservedAt(),
+		Status:             "allowed",
+		AccountFingerprint: coreauth.AnthropicAccountFingerprint(claudeAuthWithEmail(authID, "someone@example.com")),
+	})
+	blankAccount := &coreauth.Auth{ID: authID, Provider: "claude"}
+	if got := buildClaudeRateLimitEntry(blankAccount); got == nil {
+		t.Fatal("hint should survive an auth whose account became unidentifiable")
 	}
 }

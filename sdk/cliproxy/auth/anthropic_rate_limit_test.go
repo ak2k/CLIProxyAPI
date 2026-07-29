@@ -2,6 +2,7 @@ package auth
 
 import (
 	"context"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -311,18 +312,23 @@ func TestDeleteAnthropicRateLimitHint_EmptyAuthIDIsNoop(t *testing.T) {
 	}
 }
 
-// TestManagerUpdateScrubsAnthropicRateLimitHint pins the hint scrub to the
-// manager lifecycle rather than the SDK service layer. The management
-// auth-file handlers call Manager.Update directly (upsertAuthRecord), so a
-// scrub living only in Service.applyCoreAuthAddOrUpdate would let a
-// credential rotation performed through the management API keep serving the
-// previous credential's quota on /v0/management/auth-files.
-func TestManagerUpdateScrubsAnthropicRateLimitHint(t *testing.T) {
+// TestManagerUpdatePreservesHintAcrossTokenRefresh guards against scrubbing the
+// hint in Manager.Update. Update is not only the rotation path: conductor
+// refresh calls it after every routine OAuth token refresh, with the same
+// account and a new access token. Scrubbing there drops valid quota state on
+// ordinary refreshes, which — given how often Claude OAuth tokens refresh —
+// leaves /v0/management/auth-files reporting no rate_limit for much of a
+// credential's life.
+//
+// Staleness across a genuine rotation is handled on read instead, by the
+// account fingerprint (see TestAnthropicRateLimitHintFor_*).
+func TestManagerUpdatePreservesHintAcrossTokenRefresh(t *testing.T) {
 	const authID = "claude-manager-update@example.com"
 	t.Cleanup(func() { anthropicRateLimitHintByAuth.Delete(authID) })
 
 	manager := NewManager(nil, nil, nil)
-	if _, err := manager.Register(context.Background(), &Auth{ID: authID, Provider: "claude"}); err != nil {
+	account := map[string]any{"email": "steady@example.com"}
+	if _, err := manager.Register(context.Background(), &Auth{ID: authID, Provider: "claude", Metadata: account}); err != nil {
 		t.Fatalf("Register() error = %v", err)
 	}
 
@@ -331,12 +337,95 @@ func TestManagerUpdateScrubsAnthropicRateLimitHint(t *testing.T) {
 		t.Fatal("expected hint to be present before Update")
 	}
 
-	if _, err := manager.Update(context.Background(), &Auth{ID: authID, Provider: "claude"}); err != nil {
+	// What conductor refresh does: same account, new access token.
+	refreshed := &Auth{ID: authID, Provider: "claude", Metadata: map[string]any{
+		"email":        "steady@example.com",
+		"access_token": "rotated-token",
+	}}
+	if _, err := manager.Update(context.Background(), refreshed); err != nil {
 		t.Fatalf("Update() error = %v", err)
 	}
 
-	if _, ok := GetAnthropicRateLimitHint(authID); ok {
-		t.Fatal("expected hint to be scrubbed by Manager.Update")
+	if _, ok := GetAnthropicRateLimitHint(authID); !ok {
+		t.Fatal("hint must survive a routine token refresh for the same account")
+	}
+}
+
+// TestAnthropicRateLimitHintFor_RejectsDifferentAccount is the read-side
+// replacement for the removed Update scrub: a capture tagged with one account
+// must not be served for an auth that now holds a different one.
+func TestAnthropicRateLimitHintFor_RejectsDifferentAccount(t *testing.T) {
+	const authID = "claude-fingerprint-rotate@example.com"
+	t.Cleanup(func() { anthropicRateLimitHintByAuth.Delete(authID) })
+
+	before := &Auth{ID: authID, Provider: "claude", Metadata: map[string]any{"email": "before@example.com"}}
+	after := &Auth{ID: authID, Provider: "claude", Metadata: map[string]any{"email": "after@example.com"}}
+
+	SetAnthropicRateLimitHint(authID, AnthropicRateLimitHint{
+		Known:              true,
+		Status:             "rejected",
+		AccountFingerprint: AnthropicAccountFingerprint(before),
+	})
+
+	if _, ok := AnthropicRateLimitHintFor(after); ok {
+		t.Fatal("expected a capture from a different account to be rejected")
+	}
+	if _, ok := AnthropicRateLimitHintFor(before); !ok {
+		t.Fatal("expected the capturing account to still read its own hint")
+	}
+}
+
+// TestAnthropicRateLimitHintFor_UnknownAccountServes pins the deliberate
+// asymmetry: rejection requires proof of a mismatch. An empty fingerprint on
+// either side means the account is unidentifiable, which must resolve to
+// serving the hint — rejecting on unknown would re-introduce the same data
+// loss the Update scrub caused, via a narrower door (a token refresh that
+// returns no email blanks the account).
+func TestAnthropicRateLimitHintFor_UnknownAccountServes(t *testing.T) {
+	const authID = "claude-fingerprint-unknown@example.com"
+	t.Cleanup(func() { anthropicRateLimitHintByAuth.Delete(authID) })
+
+	identified := &Auth{ID: authID, Provider: "claude", Metadata: map[string]any{"email": "someone@example.com"}}
+	anonymous := &Auth{ID: authID, Provider: "claude"}
+
+	if got := AnthropicAccountFingerprint(anonymous); got != "" {
+		t.Fatalf("expected empty fingerprint for an auth with no account, got %q", got)
+	}
+
+	// Stored without a fingerprint, read by an identified auth.
+	SetAnthropicRateLimitHint(authID, AnthropicRateLimitHint{Known: true, Status: "allowed"})
+	if _, ok := AnthropicRateLimitHintFor(identified); !ok {
+		t.Fatal("hint stored without a fingerprint must still be served")
+	}
+
+	// Stored with a fingerprint, read by an auth whose account went blank.
+	SetAnthropicRateLimitHint(authID, AnthropicRateLimitHint{
+		Known:              true,
+		Status:             "allowed",
+		AccountFingerprint: AnthropicAccountFingerprint(identified),
+	})
+	if _, ok := AnthropicRateLimitHintFor(anonymous); !ok {
+		t.Fatal("hint must survive an auth whose account became unidentifiable")
+	}
+}
+
+// TestAnthropicAccountFingerprint_DoesNotLeakAPIKey pins that the fingerprint
+// is a hash: for API-key auths AccountInfo returns the key itself, which must
+// not be stored in a process-wide map or reach a management response.
+func TestAnthropicAccountFingerprint_DoesNotLeakAPIKey(t *testing.T) {
+	const secret = "sk-ant-super-secret-key"
+	auth := &Auth{
+		ID:         "claude-apikey@example.com",
+		Provider:   "claude",
+		Attributes: map[string]string{AttributeAPIKey: secret},
+	}
+
+	got := AnthropicAccountFingerprint(auth)
+	if got == "" {
+		t.Fatal("expected a fingerprint for an api-key auth")
+	}
+	if strings.Contains(got, secret) {
+		t.Fatalf("fingerprint leaks the API key: %q", got)
 	}
 }
 
@@ -362,24 +451,5 @@ func TestManagerRemoveScrubsAnthropicRateLimitHint(t *testing.T) {
 
 	if _, ok := GetAnthropicRateLimitHint(authID); ok {
 		t.Fatal("expected hint to be scrubbed by Manager.Remove")
-	}
-}
-
-// TestManagerUpdateUnknownAuthLeavesHintIntact guards the placement of the
-// scrub relative to Update's existence check: Update returns early for an
-// unregistered ID, and must not scrub in that case.
-func TestManagerUpdateUnknownAuthLeavesHintIntact(t *testing.T) {
-	const authID = "claude-manager-update-unknown@example.com"
-	t.Cleanup(func() { anthropicRateLimitHintByAuth.Delete(authID) })
-
-	manager := NewManager(nil, nil, nil)
-	SetAnthropicRateLimitHint(authID, AnthropicRateLimitHint{Known: true, Status: "allowed"})
-
-	if _, err := manager.Update(context.Background(), &Auth{ID: authID, Provider: "claude"}); err != nil {
-		t.Fatalf("Update() error = %v", err)
-	}
-
-	if _, ok := GetAnthropicRateLimitHint(authID); !ok {
-		t.Fatal("expected hint to survive Update of an unregistered auth")
 	}
 }

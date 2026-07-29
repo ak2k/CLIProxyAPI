@@ -142,14 +142,12 @@ func (m *Manager) Update(ctx context.Context, auth *Auth) (*Auth, error) {
 		m.scheduler.upsertAuth(authClone)
 	}
 	m.queueRefreshReschedule(auth.ID)
-	// An in-place update of an existing auth.ID may be a credential
-	// rotation (same ID, new underlying account), so drop the Anthropic
-	// rate-limit hint rather than let the management API report the
-	// previous credential's quota. Centralised here, in the manager
-	// lifecycle, so direct callers (the management auth-file handlers
-	// upsert via Manager.Update without going through the SDK service
-	// path) are covered too. No-op for IDs without a stored hint.
-	DeleteAnthropicRateLimitHint(auth.ID)
+	// No Anthropic rate-limit scrub here on purpose. Update is the routine
+	// token-refresh path (conductor_refresh.go calls it after every OAuth
+	// refresh), not just the rotation path, so clearing the hint would drop
+	// valid quota state for the same account on an ordinary refresh. A
+	// rotation to a different account is handled on read instead, by the
+	// account fingerprint on the hint.
 	_ = m.persist(ctx, auth)
 	m.hook.OnAuthUpdated(ctx, auth.Clone())
 	if clearedCooldown {
@@ -200,10 +198,11 @@ func (m *Manager) Remove(ctx context.Context, id string) {
 	}
 	m.queueRefreshUnschedule(id)
 	m.invalidateSessionAffinity(id)
-	// Scrub the Anthropic rate-limit hint so an auth recreated with the
-	// same ID cannot surface the removed credential's quota. Provider-
-	// agnostic: the hint store is keyed by authID and this is a no-op for
-	// IDs without a stored hint.
+	// Release the Anthropic rate-limit hint along with the credential.
+	// Provider-agnostic: the hint store is keyed by authID and this is a
+	// no-op for IDs without a stored hint. Staleness against an auth later
+	// recreated under this ID is handled on read via the account
+	// fingerprint; this keeps the store from retaining dead entries.
 	DeleteAnthropicRateLimitHint(id)
 
 	if provider != "" {

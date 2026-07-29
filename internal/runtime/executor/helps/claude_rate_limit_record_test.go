@@ -1,6 +1,7 @@
 package helps
 
 import (
+	"context"
 	"net/http"
 	"testing"
 	"time"
@@ -12,12 +13,26 @@ import (
 // against a clean slate. The hint store is package-global; tests share it.
 func resetAnthropicHint(t *testing.T, authID string) {
 	t.Helper()
+	cliproxyauth.DeleteAnthropicRateLimitHint(authID)
 	t.Cleanup(func() {
-		// Best-effort cleanup. The store has no public Delete; rely on tests
-		// using unique authIDs to avoid cross-pollution. This helper exists
-		// for documentation, in case a Delete API ships later.
-		_ = authID
+		cliproxyauth.DeleteAnthropicRateLimitHint(authID)
 	})
+}
+
+// testAuth builds the minimal OAuth auth the capture path needs: an ID to key
+// the store by, and an email so AnthropicAccountFingerprint resolves to a
+// stable non-empty value. Tests that care about account identity pass an
+// explicit email; the rest reuse the authID.
+func testAuth(authID string) *cliproxyauth.Auth {
+	return testAuthWithEmail(authID, authID)
+}
+
+func testAuthWithEmail(authID, email string) *cliproxyauth.Auth {
+	return &cliproxyauth.Auth{
+		ID:       authID,
+		Provider: "claude",
+		Metadata: map[string]any{"email": email},
+	}
 }
 
 // fixturePinnedNow is when the captured fixtures were observed. Pinning keeps
@@ -108,7 +123,7 @@ func TestRecordAnthropicRateLimit_Typical200(t *testing.T) {
 	resetAnthropicHint(t, authID)
 
 	now := fixturePinnedNow()
-	RecordAnthropicRateLimit(authID, realCapture200Allowed(), now)
+	RecordAnthropicRateLimit(testAuth(authID), realCapture200Allowed(), now)
 
 	hint, ok := cliproxyauth.GetAnthropicRateLimitHint(authID)
 	if !ok || !hint.Known {
@@ -179,7 +194,7 @@ func TestRecordAnthropicRateLimit_GenerativeTierWindow(t *testing.T) {
 	const authID = "claude-test-tier-window@example.com"
 	resetAnthropicHint(t, authID)
 
-	RecordAnthropicRateLimit(authID, realCapture200WarningWithTierWindow(), fixturePinnedNow())
+	RecordAnthropicRateLimit(testAuth(authID), realCapture200WarningWithTierWindow(), fixturePinnedNow())
 
 	hint, _ := cliproxyauth.GetAnthropicRateLimitHint(authID)
 	if hint.Status != "allowed_warning" {
@@ -224,7 +239,7 @@ func TestRecordAnthropicRateLimit_429Rejected(t *testing.T) {
 	const authID = "claude-test-429-rejected@example.com"
 	resetAnthropicHint(t, authID)
 
-	RecordAnthropicRateLimit(authID, realCapture429Rejected(), fixturePinnedNow())
+	RecordAnthropicRateLimit(testAuth(authID), realCapture429Rejected(), fixturePinnedNow())
 
 	hint, ok := cliproxyauth.GetAnthropicRateLimitHint(authID)
 	if !ok || !hint.Known {
@@ -266,7 +281,7 @@ func TestRecordAnthropicRateLimit_NoUnifiedHeaders(t *testing.T) {
 		"Content-Type": {"application/json"},
 		"Retry-After":  {"60"},
 	}
-	RecordAnthropicRateLimit(authID, headersWithoutFamily, fixturePinnedNow())
+	RecordAnthropicRateLimit(testAuth(authID), headersWithoutFamily, fixturePinnedNow())
 
 	got, ok := cliproxyauth.GetAnthropicRateLimitHint(authID)
 	if !ok {
@@ -295,7 +310,7 @@ func TestRecordAnthropicRateLimit_HeadersWithoutUnifiedStatus(t *testing.T) {
 		"Anthropic-Ratelimit-Unified-Representative-Claim": {"five_hour"},
 		"Anthropic-Ratelimit-Unified-Reset":                {"1777500000"},
 	}
-	RecordAnthropicRateLimit(authID, headers, fixturePinnedNow())
+	RecordAnthropicRateLimit(testAuth(authID), headers, fixturePinnedNow())
 
 	hint, ok := cliproxyauth.GetAnthropicRateLimitHint(authID)
 	if !ok || !hint.Known {
@@ -320,7 +335,7 @@ func TestRecordAnthropicRateLimit_NilHeadersNoop(t *testing.T) {
 	const authID = "claude-test-nil-headers@example.com"
 	resetAnthropicHint(t, authID)
 
-	RecordAnthropicRateLimit(authID, nil, fixturePinnedNow())
+	RecordAnthropicRateLimit(testAuth(authID), nil, fixturePinnedNow())
 
 	if _, ok := cliproxyauth.GetAnthropicRateLimitHint(authID); ok {
 		t.Fatal("nil headers should not create a hint")
@@ -328,9 +343,16 @@ func TestRecordAnthropicRateLimit_NilHeadersNoop(t *testing.T) {
 }
 
 func TestRecordAnthropicRateLimit_EmptyAuthIDNoop(t *testing.T) {
-	RecordAnthropicRateLimit("", realCapture200Allowed(), fixturePinnedNow())
-	RecordAnthropicRateLimit("   ", realCapture200Allowed(), fixturePinnedNow())
+	RecordAnthropicRateLimit(testAuth(""), realCapture200Allowed(), fixturePinnedNow())
+	RecordAnthropicRateLimit(testAuth("   "), realCapture200Allowed(), fixturePinnedNow())
 	// Assertion: doesn't panic, doesn't pollute the hint store.
+}
+
+func TestRecordAnthropicRateLimit_NilAuthNoop(t *testing.T) {
+	RecordAnthropicRateLimit(nil, realCapture200Allowed(), fixturePinnedNow())
+	// Assertion: doesn't panic. The executor call sites pass auth straight
+	// through and it is nil-checked there today, but the helper must not
+	// depend on that.
 }
 
 func TestRecordAnthropicRateLimit_MalformedNumericsAreTolerated(t *testing.T) {
@@ -346,7 +368,7 @@ func TestRecordAnthropicRateLimit_MalformedNumericsAreTolerated(t *testing.T) {
 		"Anthropic-Ratelimit-Unified-Fallback-Percentage":  {""},
 		"Anthropic-Ratelimit-Unified-Reset":                {"1777500000"},
 	}
-	RecordAnthropicRateLimit(authID, headers, fixturePinnedNow())
+	RecordAnthropicRateLimit(testAuth(authID), headers, fixturePinnedNow())
 
 	hint, _ := cliproxyauth.GetAnthropicRateLimitHint(authID)
 	if hint.Status != "allowed" {
@@ -380,8 +402,8 @@ func TestRecordAnthropicRateLimit_OverwritesPriorHint(t *testing.T) {
 	const authID = "claude-test-overwrite@example.com"
 	resetAnthropicHint(t, authID)
 
-	RecordAnthropicRateLimit(authID, realCapture200Allowed(), fixturePinnedNow())
-	RecordAnthropicRateLimit(authID, realCapture429Rejected(), fixturePinnedNow().Add(time.Minute))
+	RecordAnthropicRateLimit(testAuth(authID), realCapture200Allowed(), fixturePinnedNow())
+	RecordAnthropicRateLimit(testAuth(authID), realCapture429Rejected(), fixturePinnedNow().Add(time.Minute))
 
 	hint, _ := cliproxyauth.GetAnthropicRateLimitHint(authID)
 	if hint.Status != "rejected" {
@@ -402,7 +424,7 @@ func TestRecordAnthropicRateLimit_UnknownFieldGoesToRawHeadersOnly(t *testing.T)
 		"Anthropic-Ratelimit-Unified-Reset":                {"1777500000"},
 		"Anthropic-Ratelimit-Unified-Future-Field-Type-X":  {"someValue"}, // not a known top-level or per-window suffix
 	}
-	RecordAnthropicRateLimit(authID, headers, fixturePinnedNow())
+	RecordAnthropicRateLimit(testAuth(authID), headers, fixturePinnedNow())
 
 	hint, _ := cliproxyauth.GetAnthropicRateLimitHint(authID)
 	if got := hint.RawHeaders["anthropic-ratelimit-unified-future-field-type-x"]; got != "someValue" {
@@ -438,7 +460,7 @@ func TestRecordAnthropicRateLimit_UnknownTopLevelDoesNotFabricateWindow(t *testi
 		"Anthropic-Ratelimit-Unified-Bar-Utilization":         {"0.42"},
 		"Anthropic-Ratelimit-Unified-Baz-Surpassed-Threshold": {"0.9"},
 	}
-	RecordAnthropicRateLimit(authID, headers, fixturePinnedNow())
+	RecordAnthropicRateLimit(testAuth(authID), headers, fixturePinnedNow())
 
 	hint, ok := cliproxyauth.GetAnthropicRateLimitHint(authID)
 	if !ok || !hint.Known {
@@ -494,7 +516,7 @@ func TestRecordAnthropicRateLimit_FutureTierWindowsAccepted(t *testing.T) {
 		"Anthropic-Ratelimit-Unified-7d_haiku-Utilization": {"0.8"},
 		"Anthropic-Ratelimit-Unified-Status":               {"allowed"},
 	}
-	RecordAnthropicRateLimit(authID, headers, fixturePinnedNow())
+	RecordAnthropicRateLimit(testAuth(authID), headers, fixturePinnedNow())
 
 	hint, _ := cliproxyauth.GetAnthropicRateLimitHint(authID)
 	wantWindows := map[string]float64{
@@ -545,7 +567,7 @@ func TestRecordAnthropicRateLimit_HasUtilizationDistinguishesAbsentFromZero(t *t
 		"Anthropic-Ratelimit-Unified-7d-Status": {"allowed"},
 		"Anthropic-Ratelimit-Unified-7d-Reset":  {"1777561200"},
 	}
-	RecordAnthropicRateLimit(authID, headers, fixturePinnedNow())
+	RecordAnthropicRateLimit(testAuth(authID), headers, fixturePinnedNow())
 
 	hint, ok := cliproxyauth.GetAnthropicRateLimitHint(authID)
 	if !ok || !hint.Known {
@@ -628,5 +650,72 @@ func TestParseAnthropicFloat(t *testing.T) {
 		if got != tc.want {
 			t.Errorf("parseAnthropicFloat(%q)=%v want %v", tc.in, got, tc.want)
 		}
+	}
+}
+
+// TestRecordAnthropicRateLimit_SurvivesTokenRefreshButNotRotation is the
+// end-to-end guard over the capture → lifecycle → read path, exercised through
+// a real Manager rather than by poking the store directly.
+//
+// Both halves were live defects at some point in this feature's history: an
+// unconditional scrub in Manager.Update destroyed valid quota state on every
+// routine token refresh, and before the account fingerprint existed a capture
+// could outlive the credential it described.
+func TestRecordAnthropicRateLimit_SurvivesTokenRefreshButNotRotation(t *testing.T) {
+	const authID = "claude-e2e-refresh-vs-rotation@example.com"
+	resetAnthropicHint(t, authID)
+
+	manager := cliproxyauth.NewManager(nil, nil, nil)
+	ctx := context.Background()
+
+	original := testAuthWithEmail(authID, "account-one@example.com")
+	if _, err := manager.Register(ctx, original); err != nil {
+		t.Fatalf("Register() error = %v", err)
+	}
+
+	// A Claude response lands and is captured.
+	RecordAnthropicRateLimit(original, realCapture200WarningWithTierWindow(), fixturePinnedNow())
+	if _, ok := cliproxyauth.AnthropicRateLimitHintFor(original); !ok {
+		t.Fatal("precondition: capture should be readable")
+	}
+
+	// Routine OAuth token refresh: same account, new access token.
+	refreshed := testAuthWithEmail(authID, "account-one@example.com")
+	refreshed.Metadata["access_token"] = "refreshed-token"
+	if _, err := manager.Update(ctx, refreshed); err != nil {
+		t.Fatalf("Update() error = %v", err)
+	}
+	hint, ok := cliproxyauth.AnthropicRateLimitHintFor(refreshed)
+	if !ok {
+		t.Fatal("quota state must survive a routine token refresh")
+	}
+	if hint.Status != "allowed_warning" {
+		t.Errorf("Status=%q want %q after refresh", hint.Status, "allowed_warning")
+	}
+
+	// Rotation to a different account under the same auth ID.
+	rotated := testAuthWithEmail(authID, "account-two@example.com")
+	if _, err := manager.Update(ctx, rotated); err != nil {
+		t.Fatalf("Update() error = %v", err)
+	}
+	if _, ok := cliproxyauth.AnthropicRateLimitHintFor(rotated); ok {
+		t.Fatal("the previous account's quota must not be served after rotation")
+	}
+
+	// A capture still in flight when the rotation happened lands late, tagged
+	// with the old account. It must not resurrect the old quota.
+	RecordAnthropicRateLimit(original, realCapture429Rejected(), fixturePinnedNow().Add(time.Second))
+	if _, ok := cliproxyauth.AnthropicRateLimitHintFor(rotated); ok {
+		t.Fatal("a late capture from the previous account must not be served to the rotated auth")
+	}
+
+	// And the rotated account's own capture is served normally.
+	RecordAnthropicRateLimit(rotated, realCapture200Allowed(), fixturePinnedNow().Add(2*time.Second))
+	hint, ok = cliproxyauth.AnthropicRateLimitHintFor(rotated)
+	if !ok {
+		t.Fatal("the rotated account must see its own capture")
+	}
+	if hint.Status != "allowed" {
+		t.Errorf("Status=%q want %q for the rotated account", hint.Status, "allowed")
 	}
 }

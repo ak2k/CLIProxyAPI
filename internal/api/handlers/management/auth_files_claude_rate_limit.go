@@ -14,7 +14,8 @@ import (
 // entry.
 //
 // Returns nil when the auth is not a Claude provider, no hint has been
-// captured yet, or the hint has Known=false. Mirrors extractCodexIDTokenClaims
+// captured yet, the hint has Known=false, or the captured hint belongs to a
+// different account than this auth now holds. Mirrors extractCodexIDTokenClaims
 // in shape and intent: provider-gated nested object, omitted entirely when
 // there's no content to surface.
 //
@@ -28,7 +29,7 @@ func buildClaudeRateLimitEntry(auth *coreauth.Auth) gin.H {
 	if !strings.EqualFold(strings.TrimSpace(auth.Provider), "claude") {
 		return nil
 	}
-	hint, ok := coreauth.GetAnthropicRateLimitHint(auth.ID)
+	hint, ok := coreauth.AnthropicRateLimitHintFor(auth)
 	if !ok || !hint.Known {
 		return nil
 	}

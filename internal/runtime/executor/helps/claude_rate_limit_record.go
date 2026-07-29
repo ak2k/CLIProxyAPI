@@ -49,16 +49,25 @@ var anthropicWindowSlugPattern = regexp.MustCompile(`^\d+[hd](?:_[a-z_]+)?$`)
 // reported in NousResearch/hermes-agent#17169), the hint store is left
 // untouched — any prior hint stays put rather than being overwritten with
 // empty state.
-func RecordAnthropicRateLimit(authID string, headers http.Header, now time.Time) {
-	authID = strings.TrimSpace(authID)
-	if authID == "" || headers == nil {
+//
+// Takes the auth rather than a bare ID so the capture can be tagged with the
+// account fingerprint it came from; readers use that to reject a capture that
+// belongs to a credential since rotated out from under this ID. A nil auth or
+// an auth with a blank ID is a no-op.
+func RecordAnthropicRateLimit(auth *cliproxyauth.Auth, headers http.Header, now time.Time) {
+	if auth == nil || headers == nil {
+		return
+	}
+	authID := strings.TrimSpace(auth.ID)
+	if authID == "" {
 		return
 	}
 
 	raw := make(map[string]string)
 	windows := make(map[string]cliproxyauth.AnthropicQuotaWindow)
 	hint := cliproxyauth.AnthropicRateLimitHint{
-		ObservedAt: now,
+		ObservedAt:         now,
+		AccountFingerprint: cliproxyauth.AnthropicAccountFingerprint(auth),
 	}
 
 	for canonicalName, values := range headers {
