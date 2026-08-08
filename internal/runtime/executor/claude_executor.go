@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
@@ -246,4 +247,44 @@ func (e *ClaudeExecutor) HttpRequest(ctx context.Context, auth *cliproxyauth.Aut
 	}
 	httpClient := helps.NewUtlsHTTPClient(ctx, e.cfg, auth, 0)
 	return httpClient.Do(httpReq)
+}
+
+// claudeCooldownFromHeaders derives the cooldown an Anthropic error response
+// asks for. Every Claude path that cools a credential down goes through here,
+// so the ordinary and fast-mode 429s cannot drift apart.
+//
+// Window selection belongs to helps.ParseClaudeRateLimitReset: it reads the
+// per-window 5h/7d/7d_oi statuses, takes the latest deadline among the
+// rejected ones and adds the retry fuzz.
+//
+// helps.ParseClaudeRetryAfter is consulted only when the headers declare a
+// genuine unified rejection and that parser still has no usable answer. The
+// gate matters: an ordinary model-level 429 carries a routine unified-reset
+// alongside healthy windows, and honouring it there would cool the credential
+// for hours on a response the caller classifies as model-scoped. What the gate
+// preserves is the case upstream's parser drops — a real rejection whose reset
+// it reads as already past because the client clock runs ahead of the
+// server's, which ParseClaudeRetryAfter recovers by anchoring to the
+// response's own Date. A negative duration counts as no answer: upstream's Sub
+// saturates and its fuzz then overflows, so a malformed epoch arrives here
+// wrapped negative and is better served by the cap.
+func claudeCooldownFromHeaders(headers http.Header) *time.Duration {
+	d := helps.ParseClaudeRateLimitReset(headers, time.Now())
+	if (d == nil || *d < 0) && helps.ClaudeHeadersIndicateUnifiedRateLimitRejection(headers) {
+		d = helps.ParseClaudeRetryAfter(headers, time.Now())
+	}
+	return helps.ClampClaudeRetryAfter(d)
+}
+
+// newClaudeStatusErr builds a statusErr for an Anthropic error response,
+// populating retryAfter from the response headers. Header parsing lives in
+// the helps package so it can be tested and reused without coupling to
+// executor-package types; this constructor wraps the result into the
+// executor's statusErr type at the call site.
+func newClaudeStatusErr(statusCode int, headers http.Header, body []byte) statusErr {
+	err := statusErr{code: statusCode, msg: string(body)}
+	if statusCode >= 400 && statusCode < 600 {
+		err.retryAfter = claudeCooldownFromHeaders(headers)
+	}
+	return err
 }

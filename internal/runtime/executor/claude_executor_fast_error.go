@@ -146,7 +146,11 @@ func newClaudeFastDirectResponseError(resp *http.Response, body []byte) error {
 	var retryAfter *time.Duration
 	credentialScoped := false
 	if resp.StatusCode == http.StatusTooManyRequests {
-		retryAfter = helps.ParseClaudeRateLimitReset(resp.Header, time.Now())
+		// Same derivation as every other Claude cooldown, so a fast-mode 429
+		// and an ordinary one read the same headers the same way. This one is
+		// credential-scoped, which is what makes the cap in there load-bearing:
+		// an unbounded reset would park the whole credential, not one model.
+		retryAfter = claudeCooldownFromHeaders(resp.Header)
 		if helps.ClaudeHeadersIndicateUnifiedRateLimitRejection(resp.Header) {
 			credentialScoped = true
 		}

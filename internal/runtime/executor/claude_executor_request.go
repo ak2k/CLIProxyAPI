@@ -13,7 +13,6 @@ import (
 	"net/url"
 	"sort"
 	"strings"
-	"time"
 
 	"github.com/andybalholm/brotli"
 	"github.com/google/uuid"
@@ -291,12 +290,13 @@ func (e claudeRateLimitError) IsRequestScoped() bool {
 // next one, which returns the same 429. A single speed:"fast" request would walk
 // the whole Claude pool and cool down every credential, all of which remain
 // perfectly healthy for ordinary traffic. The refusal belongs to the request.
+//
+// headers carry the Anthropic response headers so a genuine 429 keeps the
+// upstream's own reset instant (see newClaudeStatusErr); the entitlement
+// refusal is request-scoped and never reaches the cooldown path, so the
+// retryAfter it carries is inert.
 func classifyClaudeUpstreamError(statusCode int, headers http.Header, body []byte) error {
-	var retryAfter *time.Duration
-	if statusCode == http.StatusTooManyRequests || (statusCode >= 400 && statusCode < 600) {
-		retryAfter = helps.ParseClaudeRateLimitReset(headers, time.Now())
-	}
-	err := statusErr{code: statusCode, msg: string(body), retryAfter: retryAfter}
+	err := newClaudeStatusErr(statusCode, headers, body)
 	if statusCode == http.StatusTooManyRequests {
 		if helps.ClaudeHeadersIndicateUnifiedRateLimitRejection(headers) {
 			return claudeRateLimitError{statusErr: err, credentialScoped: true}
